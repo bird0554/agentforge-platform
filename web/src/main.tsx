@@ -41,7 +41,7 @@ function App() {
     { id: 't2', kind: 'tool', title: 'search_knowledge', detail: 'collection=support-handbook · top_k=4', status: 'completed', duration_ms: 342 },
     { id: 't3', kind: 'reflection', title: '结果校验', detail: '检查引用相关性与租户范围。', status: 'completed', duration_ms: 27 },
   ])
-  const [activeSession, setActiveSession] = useState('demo-session')
+  const [activeSession, setActiveSession] = useState<string | null>(null)
 
   useEffect(() => {
     Promise.allSettled([
@@ -71,10 +71,11 @@ function App() {
     setActiveTrace([{ id: `plan-${Date.now()}`, kind: 'plan', title: '分析任务', detail: '拆解目标并选择合适的工具。', status: 'running' }])
     try {
       const result = await api<{ answer?: string; output?: string; content?: string; traces?: Trace[]; steps?: Trace[]; session_id?: string }>('/agents/runs', {
-        method: 'POST', body: JSON.stringify({ message: content, session_id: activeSession, mode: 'react' }),
+        method: 'POST', body: JSON.stringify({ message: content, ...(activeSession ? { session_id: activeSession } : {}), mode: 'react' }),
       })
       const trace = result.traces || result.steps || []
       setActiveTrace(trace.length ? trace : [{ id: 'done', kind: 'reflection', title: '任务完成', detail: 'Agent 已返回结果。', status: 'completed' }])
+      if (result.session_id) setActiveSession(result.session_id)
       setMessages(current => [...current, { role: 'assistant', content: result.answer || result.output || result.content || (result as any).response || '运行完成。', traces: trace }])
     } catch {
       await new Promise(resolve => setTimeout(resolve, 550))
@@ -102,7 +103,7 @@ function App() {
     <aside className={`sidebar ${drawer ? 'sidebar-open' : ''}`}>
       <div className="brand"><div className="brand-mark"><Layers3 size={17} /></div><span>FIELDNOTES</span><small>AGENT STUDIO</small><button className="icon-button sidebar-close" aria-label="关闭导航" onClick={() => setDrawer(false)}><X size={16} /></button></div>
       <button className="workspace-switch"><div className="workspace-avatar">N</div><span><strong>Northstar Support</strong><small>企业工作区</small></span><ChevronDown size={15} /></button>
-      <button className="new-run" onClick={() => { setMessages(initialMessages); setActiveSession(`session-${Date.now()}`) }}><Plus size={16} /> 新建运行 <kbd>⌘ K</kbd></button>
+      <button className="new-run" onClick={() => { setMessages(initialMessages); setActiveSession(null) }}><Plus size={16} /> 新建运行 <kbd>⌘ K</kbd></button>
       {navItems.map(group => <div className="nav-group" key={group.group}><div className="nav-label">{group.group}</div>{group.rows.map(item => <button key={item.name} onClick={() => { setSection(item.name); setDrawer(false) }} className={`nav-item ${section === item.name ? 'selected' : ''}`}><item.icon size={16} /><span>{item.name}</span>{item.count ? <b className="nav-count">{item.count}</b> : null}</button>)}</div>)}
       <div className="sessions-heading"><span>最近对话</span><button className="icon-button" aria-label="搜索会话"><Search size={14} /></button></div>
       <label className="session-search"><Search size={14} /><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索对话" /></label>
@@ -116,7 +117,7 @@ function App() {
 
       {section === '工作台' ? <div className="workspace">
         <section className="conversation-panel">
-          <div className="conversation-head"><div><div className="eyebrow"><span className="live-pulse" />AGENT RUN · {activeSession.slice(0, 12)}</div><h1>支持运营助手</h1></div><div className="head-controls"><button className="select-control"><Bot size={15} /> support-agent <ChevronDown size={13} /></button><button className="icon-button" title="更多操作"><MoreHorizontal size={18} /></button></div></div>
+          <div className="conversation-head"><div><div className="eyebrow"><span className="live-pulse" />AGENT RUN · {activeSession?.slice(0, 12) || '新会话'}</div><h1>支持运营助手</h1></div><div className="head-controls"><button className="select-control"><Bot size={15} /> support-agent <ChevronDown size={13} /></button><button className="icon-button" title="更多操作"><MoreHorizontal size={18} /></button></div></div>
           <div className="run-mode"><span>运行模式</span><button className="mode-active">ReAct</button><button>Plan → Execute</button><span className="mode-separator" /><span className="model-label"><Radio size={13} /> openai-compatible <span className="model-dot" /> gpt-4o-mini</span></div>
           <div className="chat-scroll"><div className="date-divider"><span>今天 · 10:42</span></div>{messages.map((message, index) => <div key={`${message.role}-${index}`} className={`message-row ${message.role}`}><div className={`message-avatar ${message.role}`}>{message.role === 'assistant' ? <Sparkles size={15} /> : 'LC'}</div><div className="message-body"><div className="message-meta"><strong>{message.role === 'assistant' ? 'Support Agent' : '你'}</strong><span>{message.role === 'assistant' ? 'support-agent' : '10:42'}</span>{message.role === 'assistant' && <span className="safe-tag"><ShieldCheck size={12} /> 已检查</span>}</div><div className="message-content">{message.content}</div>{message.traces && <div className="inline-run"><span><Check size={13} /> {message.traces.length} 个步骤已完成</span><span>{message.traces.reduce((sum, trace) => sum + (trace.duration_ms || 0), 0)} ms</span><button onClick={() => setSection('运行记录')}>查看运行 <ArrowRight size={12} /></button></div>}</div></div>)}{busy && <div className="thinking"><span /><span /><span /> Agent 正在执行</div>}</div>
           <form className="composer" onSubmit={sendMessage}><div className="composer-tools"><button type="button" title="添加上下文"><Plus size={16} /></button><span><LockKeyhole size={13} /> 隔离上下文</span><button type="button" className="context-button"><Code2 size={14} /> 上下文 <ChevronDown size={12} /></button><button type="button" className="context-button"><Command size={14} /> 工具权限 <ChevronDown size={12} /></button></div><textarea value={input} onChange={event => setInput(event.target.value)} onKeyDown={event => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(event as unknown as FormEvent) } }} placeholder="描述任务，或输入 / 调用工具…" rows={2} /><div className="composer-footer"><span>Enter 发送 · Shift + Enter 换行</span><div><button type="button" className="icon-button" title="运行选项"><Settings2 size={16} /></button><button className="send-button" type="submit" disabled={!input.trim() || busy} aria-label="发送消息"><Send size={15} /></button></div></div></form>
