@@ -8,7 +8,9 @@ An extensible, self-hosted agent platform starter for building and observing too
 2. Run `docker compose up --build`.
 3. Open <http://localhost:8080>.
 
-For development, run the API with `cd api && python -m pip install -r requirements.txt && uvicorn app.main:app --reload --port 8000`. Run the web console with `cd web && npm install && npm run dev`.
+For development, run the API with `cd api && python -m pip install -r requirements.txt && uvicorn app.main:app --reload --port 8000`. Run the web console with `cd web && npm install && npm run dev`. Vite proxies `/api` to `http://127.0.0.1:8000` in local development. Set `VITE_API_URL` only when the API is hosted elsewhere.
+
+On Windows without Docker Desktop, create `.data`, then run `uvicorn app.main:app --host 127.0.0.1 --port 8000` from `api/` and `npm run dev -- --port 5173` from `web/`. Open <http://localhost:5173>.
 
 ## Capabilities
 
