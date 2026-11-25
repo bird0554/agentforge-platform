@@ -1,0 +1,31 @@
+services:
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: sqlite:////data/agent-platform.db
+      LLM_BASE_URL: ${OPENAI_BASE_URL:-}
+      LLM_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_MODEL: ${OPENAI_MODEL:-}
+      APP_SECRET: ${APP_SECRET:-development-only-change-me}
+      WEB_ORIGIN: http://localhost:8080
+    volumes:
+      - agent_data:/data
+    expose:
+      - "8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+  web:
+    build: ./web
+    ports:
+      - "8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  agent_data:
+
