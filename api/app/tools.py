@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from . import database
+from .settings import get_tool_settings
 
 
 class ToolError(ValueError):
@@ -90,12 +91,63 @@ TOOLS = {
             "priority": {"type": "string", "enum": ["low", "normal", "high"]},
         }, "required": ["title", "description"], "additionalProperties": False,
     }, "write", _ticket_create),
+    "code_sandbox": Tool("code_sandbox", "Run a short Python program in the isolated Docker sandbox.", {
+        "type": "object", "properties": {"code": {"type": "string", "minLength": 1, "maxLength": 20000}},
+        "required": ["code"], "additionalProperties": False,
+    }, "read", lambda code: code),
 }
 
 
 def list_tools() -> list[dict[str, Any]]:
-    return [{"name": tool.name, "description": tool.description, "permission": tool.permission,
-             "parameters": tool.parameters, "schema": tool.public_schema()} for tool in TOOLS.values()]
+    items = []
+    for tool in TOOLS.values():
+        settings = get_tool_settings(tool.name)
+        items.append({
+            "name": tool.name,
+            "description": tool.description,
+            "permission": settings["permission"] or tool.permission,
+            "default_permission": tool.permission,
+            "enabled": settings["enabled"],
+            "timeout_seconds": settings["timeout_seconds"],
+            "parameters": tool.parameters,
+            "schema": tool.public_schema(),
+        })
+    try:
+        from .mcp import mcp_tool_schemas
+        items.extend({
+            "name": schema["function"]["name"], "description": schema["function"]["description"],
+            "permission": get_tool_settings(schema["function"]["name"])["permission"] or "read",
+            "default_permission": "read", "enabled": get_tool_settings(schema["function"]["name"])["enabled"],
+            "timeout_seconds": get_tool_settings(schema["function"]["name"])["timeout_seconds"], "parameters": schema["function"]["parameters"], "schema": schema,
+        } for schema in mcp_tool_schemas())
+    except (ImportError, ValueError):
+        pass
+    try:
+        from .a2a_runtime import a2a_tool_schemas
+        items.extend({
+            "name": schema["function"]["name"], "description": schema["function"]["description"],
+            "permission": get_tool_settings(schema["function"]["name"])["permission"] or "read",
+            "default_permission": "read", "enabled": get_tool_settings(schema["function"]["name"])["enabled"],
+            "timeout_seconds": get_tool_settings(schema["function"]["name"])["timeout_seconds"], "parameters": schema["function"]["parameters"], "schema": schema,
+        } for schema in a2a_tool_schemas())
+    except (ImportError, ValueError):
+        pass
+    return items
+
+
+def enabled_tool_schemas() -> list[dict[str, Any]]:
+    schemas = [tool.public_schema() for tool in TOOLS.values() if get_tool_settings(tool.name)["enabled"]]
+    try:
+        from .mcp import mcp_tool_schemas
+        schemas.extend(schema for schema in mcp_tool_schemas() if get_tool_settings(schema["function"]["name"])["enabled"])
+    except (ImportError, ValueError):
+        pass
+    try:
+        from .a2a_runtime import a2a_tool_schemas
+        schemas.extend(schema for schema in a2a_tool_schemas() if get_tool_settings(schema["function"]["name"])["enabled"])
+    except (ImportError, ValueError):
+        pass
+    return schemas
 
 
 def _validate_arguments(tool: Tool, arguments: dict[str, Any]) -> None:
@@ -109,28 +161,111 @@ def _validate_arguments(tool: Tool, arguments: dict[str, Any]) -> None:
             raise ToolError(f"Missing required argument: {name}")
     for name, value in arguments.items():
         definition = properties.get(name)
-        if not definition or not isinstance(value, str):
+        if not definition:
             raise ToolError(f"Invalid argument: {name}")
-        if len(value) > definition.get("maxLength", 10000) or len(value) < definition.get("minLength", 0):
+        expected_type = definition.get("type")
+        valid_type = {
+            "string": isinstance(value, str),
+            "number": isinstance(value, (int, float)) and not isinstance(value, bool),
+            "integer": isinstance(value, int) and not isinstance(value, bool),
+            "boolean": isinstance(value, bool),
+            "object": isinstance(value, dict),
+            "array": isinstance(value, list),
+        }.get(expected_type, False)
+        if not valid_type:
+            raise ToolError(f"Invalid argument: {name}")
+        if isinstance(value, str) and (len(value) > definition.get("maxLength", 10000) or len(value) < definition.get("minLength", 0)):
             raise ToolError(f"Argument length is invalid: {name}")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if "minimum" in definition and value < definition["minimum"]:
+                raise ToolError(f"Argument is below minimum: {name}")
+            if "maximum" in definition and value > definition["maximum"]:
+                raise ToolError(f"Argument is above maximum: {name}")
         if "enum" in definition and value not in definition["enum"]:
             raise ToolError(f"Unsupported value for: {name}")
 
 
-async def execute_tool(name: str, arguments: dict[str, Any], tenant_id: str, conversation_id: str) -> dict[str, Any]:
+async def execute_tool(name: str, arguments: dict[str, Any], tenant_id: str, conversation_id: str, *, bypass_approval: bool = False) -> dict[str, Any]:
     tool = TOOLS.get(name)
+    if tool is None and (name.startswith("mcp__") or name.startswith("a2a__")):
+        settings = get_tool_settings(name)
+        if not settings["enabled"]:
+            return {"error": "Tool is disabled by policy", "status": "failed"}
+        if settings["permission"] == "write" and not bypass_approval:
+            approval_id = str(uuid.uuid4())
+            with database.connection() as db:
+                db.execute("INSERT INTO approvals(id, tenant_id, conversation_id, tool_name, arguments) VALUES (?, ?, ?, ?, ?)",
+                           (approval_id, tenant_id, conversation_id, name, json.dumps(arguments, ensure_ascii=False)))
+                database.add_audit_event(db, tenant_id, "approval.requested", "tool", name, {"approval_id": approval_id})
+            return {"approval_required": True, "approval_id": approval_id, "message": "Waiting for a human approval decision."}
+    if tool is None and name.startswith("mcp__"):
+        from .mcp import execute_mcp_tool
+        settings = get_tool_settings(name)
+        if not settings["enabled"]:
+            return {"error": "Tool is disabled by policy", "status": "failed"}
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(execute_mcp_tool(name, arguments), timeout=float(settings["timeout_seconds"]))
+            status, error = "success", None
+            return {"result": result, "status": status}
+        except Exception as exc:
+            status, error = "failed", str(exc)[:300]
+            return {"error": error, "status": status}
+        finally:
+            with database.connection() as db:
+                db.execute("INSERT INTO tool_runs(tenant_id, conversation_id, tool_name, status, duration_ms, error) VALUES (?, ?, ?, ?, ?, ?)",
+                           (tenant_id, conversation_id, name, status, int((time.monotonic() - started) * 1000), error))
+                database.add_audit_event(db, tenant_id, f"tool.{status}", "mcp_tool", name, {"conversation_id": conversation_id})
+    if tool is None and name.startswith("a2a__"):
+        from .a2a_runtime import execute_a2a_tool
+        settings = get_tool_settings(name)
+        if not settings["enabled"]:
+            return {"error": "Tool is disabled by policy", "status": "failed"}
+        started = time.monotonic()
+        try:
+            result = await asyncio.wait_for(execute_a2a_tool(name, arguments), timeout=float(settings["timeout_seconds"]))
+            status, error = "success", None
+            return result
+        except Exception as exc:
+            status, error = "failed", str(exc)[:300]
+            return {"error": error, "status": status}
+        finally:
+            with database.connection() as db:
+                db.execute("INSERT INTO tool_runs(tenant_id, conversation_id, tool_name, status, duration_ms, error) VALUES (?, ?, ?, ?, ?, ?)",
+                           (tenant_id, conversation_id, name, status, int((time.monotonic() - started) * 1000), error))
+                database.add_audit_event(db, tenant_id, f"tool.{status}", "a2a_tool", name, {"conversation_id": conversation_id})
     if not tool:
         raise ToolError("Tool is not registered")
+    settings = get_tool_settings(name)
+    if not settings["enabled"]:
+        raise ToolError("Tool is disabled by policy")
     _validate_arguments(tool, arguments)
-    if tool.permission == "write":
+    if name == "code_sandbox":
+        from .sandbox import run_code
+        started = time.monotonic()
+        try:
+            result = await run_code(arguments["code"])
+            status, error = "success", None
+            return {"result": result, "status": status}
+        except Exception as exc:
+            status, error = "failed", str(exc)[:300]
+            return {"error": error, "status": status}
+        finally:
+            with database.connection() as db:
+                db.execute("INSERT INTO tool_runs(tenant_id, conversation_id, tool_name, status, duration_ms, error) VALUES (?, ?, ?, ?, ?, ?)",
+                           (tenant_id, conversation_id, name, status, int((time.monotonic() - started) * 1000), error))
+                database.add_audit_event(db, tenant_id, f"tool.{status}", "sandbox", name, {"conversation_id": conversation_id})
+    permission = settings["permission"] or tool.permission
+    if permission == "write":
         approval_id = str(uuid.uuid4())
         with database.connection() as db:
             db.execute("INSERT INTO approvals(id, tenant_id, conversation_id, tool_name, arguments) VALUES (?, ?, ?, ?, ?)",
                        (approval_id, tenant_id, conversation_id, name, json.dumps(arguments, ensure_ascii=False)))
+            database.add_audit_event(db, tenant_id, "approval.requested", "tool", name, {"approval_id": approval_id})
         return {"approval_required": True, "approval_id": approval_id, "message": "Waiting for a human approval decision."}
     started = time.monotonic()
     try:
-        result = await asyncio.wait_for(asyncio.to_thread(tool.handler, **arguments), timeout=3)
+        result = await asyncio.wait_for(asyncio.to_thread(tool.handler, **arguments), timeout=float(settings["timeout_seconds"]))
         status, error = "success", None
         return {"result": result, "status": status}
     except (TimeoutError, ToolError, ZeroDivisionError, TypeError) as exc:
@@ -141,16 +276,50 @@ async def execute_tool(name: str, arguments: dict[str, Any], tenant_id: str, con
         with database.connection() as db:
             db.execute("INSERT INTO tool_runs(tenant_id, conversation_id, tool_name, status, duration_ms, error) VALUES (?, ?, ?, ?, ?, ?)",
                        (tenant_id, conversation_id, name, status, duration, error))
+            database.add_audit_event(db, tenant_id, f"tool.{status}", "tool", name, {"conversation_id": conversation_id})
 
 
-def decide_approval(approval_id: str, tenant_id: str, decision: str) -> dict[str, Any] | None:
+async def decide_approval(approval_id: str, tenant_id: str, decision: str) -> dict[str, Any] | None:
+    with database.connection() as db:
+        pending = db.execute("SELECT * FROM approvals WHERE id = ? AND tenant_id = ? AND status = 'pending'", (approval_id, tenant_id)).fetchone()
+    if not pending:
+        return None
+    if pending["tool_name"].startswith(("mcp__", "a2a__")):
+        tool_name = pending["tool_name"]
+        settings = get_tool_settings(tool_name)
+        if decision == "approve" and (settings["permission"] != "write" or not settings["enabled"]):
+            return None
+        if decision == "approve":
+            with database.connection() as db:
+                claimed = db.execute(
+                    "UPDATE approvals SET status = 'processing' WHERE id = ? AND tenant_id = ? AND status = 'pending'",
+                    (approval_id, tenant_id),
+                )
+            if not claimed.rowcount:
+                return None
+            arguments = json.loads(pending["arguments"])
+            result = await execute_tool(tool_name, arguments, tenant_id, pending["conversation_id"], bypass_approval=True)
+            status = "approved" if result.get("status") == "success" else "failed"
+        else:
+            result = {"message": "Human reviewer rejected this action."}
+            status = "rejected"
+        result_json = json.dumps(result, ensure_ascii=False)
+        with database.connection() as db:
+            expected_status = "processing" if decision == "approve" else "pending"
+            cursor = db.execute("UPDATE approvals SET status = ?, result = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ? AND tenant_id = ? AND status = ?",
+                                (status, result_json, approval_id, tenant_id, expected_status))
+            if not cursor.rowcount:
+                return None
+            database.add_audit_event(db, tenant_id, f"approval.{status}", "approval", approval_id, {"tool_name": tool_name})
+        return {"id": approval_id, "status": status, "result": result}
     with database.connection() as db:
         row = db.execute("SELECT * FROM approvals WHERE id = ? AND tenant_id = ? AND status = 'pending'", (approval_id, tenant_id)).fetchone()
         if not row:
             return None
         if decision == "approve":
             tool = TOOLS.get(row["tool_name"])
-            if not tool or tool.permission != "write":
+            settings = get_tool_settings(row["tool_name"])
+            if not tool or (settings["permission"] or tool.permission) != "write" or not settings["enabled"]:
                 return None
             arguments = json.loads(row["arguments"])
             try:
@@ -165,4 +334,5 @@ def decide_approval(approval_id: str, tenant_id: str, decision: str) -> dict[str
         db.execute("UPDATE approvals SET status = ?, result = ?, reviewed_at = CURRENT_TIMESTAMP WHERE id = ?", (status, result_json, approval_id))
         db.execute("INSERT INTO tool_runs(tenant_id, conversation_id, tool_name, status, error) VALUES (?, ?, ?, ?, ?)",
                    (tenant_id, row["conversation_id"], row["tool_name"], status, None if status != "failed" else "Tool execution failed"))
+        database.add_audit_event(db, tenant_id, f"approval.{status}", "approval", approval_id, {"tool_name": row["tool_name"]})
     return {"id": approval_id, "status": status, "result": json.loads(result_json)}

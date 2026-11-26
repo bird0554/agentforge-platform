@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import dataclass
 from typing import Any
 
 import httpx
+
+from .settings import runtime_model_settings
 
 
 @dataclass
@@ -15,15 +16,19 @@ class ModelTurn:
 
 
 class OpenAICompatibleProvider:
-    def __init__(self) -> None:
-        self.base_url = os.getenv("LLM_BASE_URL", "").rstrip("/")
-        self.api_key = os.getenv("LLM_API_KEY", "")
-        self.model = os.getenv("LLM_MODEL", "gpt-4o-mini")
-        self.timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "25"))
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        saved = config if config is not None else runtime_model_settings()
+        self.provider = saved.get("provider", "demo")
+        self.base_url = (saved.get("base_url") or "").rstrip("/")
+        self.api_key = saved.get("api_key", "")
+        self.model = saved.get("model", "gpt-4o-mini")
+        self.timeout = float(saved.get("timeout_seconds", 25))
+        self.temperature = float(saved.get("temperature", 0.2))
+        self.max_tokens = int(saved.get("max_tokens", 1200))
 
     @property
     def configured(self) -> bool:
-        return bool(self.base_url and self.api_key)
+        return self.provider != "demo" and bool(self.base_url and self.api_key)
 
     async def complete(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelTurn:
         if not self.configured:
@@ -32,7 +37,14 @@ class OpenAICompatibleProvider:
             response = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {self.api_key}"},
-                json={"model": self.model, "messages": messages, "tools": tools, "tool_choice": "auto"},
+                json={
+                    "model": self.model,
+                    "messages": messages,
+                    "tools": tools,
+                    "tool_choice": "auto",
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                },
             )
             response.raise_for_status()
             choice = response.json()["choices"][0]["message"]
@@ -45,6 +57,25 @@ class OpenAICompatibleProvider:
                 arguments = None
             calls.append({"id": call.get("id", ""), "name": function.get("name", ""), "arguments": arguments})
         return ModelTurn(content=choice.get("content") or "", tool_calls=calls)
+
+    async def test_connection(self) -> None:
+        if not self.configured:
+            raise ValueError("An OpenAI-compatible endpoint and API key are required")
+        async with httpx.AsyncClient(timeout=self.timeout) as client:
+            response = await client.post(
+                f"{self.base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {self.api_key}"},
+                json={
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": "Reply with OK."}],
+                    "temperature": self.temperature,
+                    "max_tokens": min(self.max_tokens, 32),
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        if not payload.get("choices"):
+            raise ValueError("The model endpoint returned no choices")
 
     @staticmethod
     def _demo_turn(messages: list[dict[str, Any]]) -> ModelTurn:
