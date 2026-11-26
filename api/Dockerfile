@@ -4,6 +4,9 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY tests ./tests
-RUN mkdir -p /data
+RUN addgroup --system app && adduser --system --ingroup app app \
+    && mkdir -p /data \
+    && chown -R app:app /app /data
+USER app
 EXPOSE 8000
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
